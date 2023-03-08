@@ -1,0 +1,9 @@
+<launch>
+    <arg name="veh" doc="Name of vehicle. ex: megaman"/>
+
+    <group ns="$(arg veh)">
+      <node pkg="lane_following" type="lane_following_node.py" name="lane_following_node"  output="screen">
+      </node>
+
+    </group>
+</launch>
