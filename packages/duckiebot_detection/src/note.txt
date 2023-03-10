@@ -1,0 +1,13 @@
+!!IF the bot turns you turn. If it doesn’t you don’t. 
+For that I’d say we detect the intersection,
+We need to stop whether or not we are turning.
+If we could detect the leader before 
+and we aren’t detecting the leader anymore, then we turn - turn right for right lane following.
+
+If we weren’t tailing a bot to begin with, we decide. Could decide randomly but I prefer to just drive straight
+
+
+○ Blink the appropriate rear LED to signal left or right turns at the intersection 
+What’s the rear LED? How do we change it? Is this just another service? What’s the appropriate signal?
+
+How do we tell when our leader is turning? Do the detections return pose estimates?
