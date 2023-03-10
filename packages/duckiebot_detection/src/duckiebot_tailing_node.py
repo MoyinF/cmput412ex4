@@ -131,7 +131,8 @@ class DuckiebotTailingNode(DTROS):
 
     def run(self):
         if self.detection:
-            self.tail()
+            self.tailPID()
+            # self.tail() # want to try this out also
 
         else:
             self.drive()
