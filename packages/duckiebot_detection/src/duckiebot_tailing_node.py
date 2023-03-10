@@ -14,47 +14,55 @@ from duckietown_msgs.srv import ChangePattern
 from dt_apriltags import Detector, Detection
 import yaml
 
-ROAD_MASK = [(20, 60, 0), (50, 255, 255)] # for yellow mask
+ROAD_MASK = [(20, 60, 0), (50, 255, 255)]  # for yellow mask
 DEBUG = False
 ENGLISH = False
 
-# using code from Justin's lane follower: works but sometimes goes straight off the mat...
-# problem: cropping sometimes removes the yellow contours, also I think the offset is too high
 
 class DuckiebotTailingNode(DTROS):
 
     def __init__(self, node_name):
-        super(DuckiebotTailingNode, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
+        super(DuckiebotTailingNode, self).__init__(
+            node_name=node_name, node_type=NodeType.GENERIC)
         self.node_name = node_name
         self.veh = rospy.get_param("~veh")
 
         # Publishers
-        self.pub_mask = rospy.Publisher("/" + self.veh + "/output/image/mask/compressed", CompressedImage, queue_size=1)
-        self.vel_pub = rospy.Publisher("/" + self.veh + "/car_cmd_switch_node/cmd", Twist2DStamped, queue_size=1)
+        self.pub_mask = rospy.Publisher(
+            "/" + self.veh + "/output/image/mask/compressed", CompressedImage, queue_size=1)
+        self.vel_pub = rospy.Publisher(
+            "/" + self.veh + "/car_cmd_switch_node/cmd", Twist2DStamped, queue_size=1)
         self.pub_img_bool = True
 
         # Subscribers
-        self.sub_camera = rospy.Subscriber("/" + self.veh + "/camera_node/image/compressed",CompressedImage,self.img_callback,queue_size=1,buff_size="20MB")
-        self.sub_distance = rospy.Subscriber(f'/{self.veh}/duckiebot_distance_node/distance', Float32, self.dist_callback)
-        self.sub_detection = rospy.Subscriber(f'/{self.veh}/duckiebot_detection_node/detection', BoolStamped, self.detection_callback)
+        self.sub_camera = rospy.Subscriber("/" + self.veh + "/camera_node/image/compressed",
+                                           CompressedImage, self.img_callback, queue_size=1, buff_size="20MB")
+        self.sub_distance = rospy.Subscriber(
+            f'/{self.veh}/duckiebot_distance_node/distance', Float32, self.dist_callback)
+        self.sub_detection = rospy.Subscriber(
+            f'/{self.veh}/duckiebot_detection_node/detection', BoolStamped, self.detection_callback)
 
         # image processing tools
         self.bridge = CvBridge()
         self.jpeg = TurboJPEG()
 
+        # info from subscribers
         self.detection = False
-        self.distance = 0
         self.intersection_detected = False
 
-        self.loginfo("Initialized")
-
         # find the calibration parameters
-        camera_intrinsic_dict =  self.readYamlFile(f'/data/config/calibrations/camera_intrinsic/{self.veh}.yaml')
+        # for detecting apriltags
+        camera_intrinsic_dict = self.readYamlFile(
+            f'/data/config/calibrations/camera_intrinsic/{self.veh}.yaml')
 
-        self.K = np.array(camera_intrinsic_dict["camera_matrix"]["data"]).reshape((3, 3))
-        self.R = np.array(camera_intrinsic_dict["rectification_matrix"]["data"]).reshape((3, 3))
-        self.D = np.array(camera_intrinsic_dict["distortion_coefficients"]["data"])
-        self.P = np.array(camera_intrinsic_dict["projection_matrix"]["data"]).reshape((3, 4))
+        self.K = np.array(
+            camera_intrinsic_dict["camera_matrix"]["data"]).reshape((3, 3))
+        self.R = np.array(
+            camera_intrinsic_dict["rectification_matrix"]["data"]).reshape((3, 3))
+        self.D = np.array(
+            camera_intrinsic_dict["distortion_coefficients"]["data"])
+        self.P = np.array(
+            camera_intrinsic_dict["projection_matrix"]["data"]).reshape((3, 4))
         self.h = camera_intrinsic_dict["image_height"]
         self.w = camera_intrinsic_dict["image_width"]
 
@@ -66,18 +74,18 @@ class DuckiebotTailingNode(DTROS):
 
         # initialize apriltag detector
         self.at_detector = Detector(searchpath=['apriltags'],
-                           families='tag36h11',
-                           nthreads=1,
-                           quad_decimate=1.0,
-                           quad_sigma=0.0,
-                           refine_edges=1,
-                           decode_sharpening=0.25,
-                           debug=0)
+                                    families='tag36h11',
+                                    nthreads=1,
+                                    quad_decimate=1.0,
+                                    quad_sigma=0.0,
+                                    refine_edges=1,
+                                    decode_sharpening=0.25,
+                                    debug=0)
         self.intersections = {
-            133: 'RED', # T intersection
-            153: 'RED', # T intersection
-            62: 'RED', # T intersection
-            58: 'RED', # T intersection
+            133: 'RED',  # T intersection
+            153: 'RED',  # T intersection
+            62: 'RED',  # T intersection
+            58: 'RED',  # T intersection
         }
         self.led_colors = {
             0: 'WHITE',
@@ -88,7 +96,7 @@ class DuckiebotTailingNode(DTROS):
         self.decision_threshold = 10
         self.z_threshold = 0.17
 
-        # PID Variables
+        # PID Variables for driving
         self.proportional = None
         if ENGLISH:
             self.offset = -170
@@ -103,56 +111,27 @@ class DuckiebotTailingNode(DTROS):
         self.last_error = 0
         self.last_time = rospy.get_time()
 
+        # PID Variables for tailing a duckiebot
+        self.distance = 0
         self.forward_P = 0.005
-        self.forward_D = -0.001
-        self.target = 0.025
-        self.forward_prop = 0
+        self.forward_D = 0.001
+        self.target = 0.25
+        self.forward_error = 0
         self.last_fwd_err = 0
         self.last_distance = 0
+        self.dist_margin = 0.05
 
         # Service proxies
         # rospy.wait_for_service(f'/{self.veh}/led_emitter_node/set_pattern')
         # self.led_service = rospy.ServiceProxy(f'/{self.veh}/led_emitter_node/set_pattern', ChangePattern)
 
+        self.loginfo("Initialized")
         # Shutdown hook
         rospy.on_shutdown(self.hook)
 
     def run(self):
         if self.detection:
-            # P Term
-            self.forward_prop = self.distance - self.target
-            P = -self.forward_prop * self.forward_P
-
-            # D Term
-            d_error = (self.forward_prop - self.last_fwd_err) / (rospy.get_time() - self.last_time)
-            self.last_fwd_err = self.forward_prop
-            self.last_time = rospy.get_time()
-            D = d_error * self.forward_D
-
-            if self.distance <= self.last_distance:
-                self.twist.v = 0
-                self.twist.omega = 0
-            elif self.distance > self.last_distance:
-                # if the duckiebot is lagging behind the leader, speed up
-                if self.distance > self.target:
-                    # self.varying_velocity = self.varying_velocity + 0.01
-                    self.twist.v = self.varying_velocity
-                    self.twist.omega = 0
-            self.last_distance = self.distance
-            self.vel_pub.publish(self.twist)
-
-            '''
-            elif self.forward_prop <= 0:
-                self.varying_velocity = self.varying_velocity - 0.01
-                self.twist.v = self.varying_velocity
-                self.twist.omega = 0
-            elif self.forward_prop > 0:
-                self.twist.v = self.velocity
-                self.twist.omega = 0
-            '''
-
-            ################## deal with turns later
-            # self.twist.omega = P + D
+            self.tailPID()
 
         else:
             self.drive()
@@ -171,7 +150,8 @@ class DuckiebotTailingNode(DTROS):
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, ROAD_MASK[0], ROAD_MASK[1])
         crop = cv2.bitwise_and(crop, crop, mask=mask)
-        contours, hierarchy = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
+        contours, hierarchy = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
         # Search for lane in front
         max_area = 20
@@ -198,11 +178,62 @@ class DuckiebotTailingNode(DTROS):
 
         # debugging
         if self.pub_img_bool:
-            rect_img_msg = CompressedImage(format="jpeg", data=self.jpeg.encode(crop))
+            rect_img_msg = CompressedImage(
+                format="jpeg", data=self.jpeg.encode(crop))
             self.pub_mask.publish(rect_img_msg)
-        if DEBUG:
-            rect_img_msg = CompressedImage(format="jpeg", data=self.jpeg.encode(crop))
-            self.pub_mask.publish(rect_img_msg)
+
+    def tailPID(self):
+        # see how it behaves when the leader is turning at a curve
+
+        # probably want to add intersection detection here (at the beginning)
+        # but before that:
+        # see how it behaves when the leader turns at an intersection
+
+        # forward error is negative if duckiebot is too close, positive if too far
+        self.forward_error = self.distance - self.target
+        P = self.forward_error * self.forward_P
+
+        d_error = (self.forward_error - self.last_fwd_err) / \
+            (rospy.get_time() - self.last_time)
+        self.last_fwd_err = self.forward_error
+        self.last_time = rospy.get_time()
+        D = -d_error * self.forward_D
+
+        if self.forward_error < 0:
+            # can change to slow down (or move back) instead of stopping
+            self.twist.v = 0
+            self.twist.omega = 0
+        else:
+            # can change to update varying velocity
+            # i.e. self.varying_velocity = self.varying_velocity + P + D
+            # then self.twist.v = self.varying_velocity
+            self.twist.v = self.velocity + P + D
+            self.twist.omega = 0
+        self.last_distance = self.distance
+        self.vel_pub.publish(self.twist)
+
+        # how to do: (turning within curved lanes + turning at intersections)? ##
+        # self.twist.omega = P + D
+
+    def tail(self):
+        # Might have been wonky because of bad target value, need to test
+        if self.distance <= self.last_distance:
+            # if the leader isn't moving, stop
+            self.twist.v = 0
+            self.twist.omega = 0
+        elif self.distance > self.last_distance + self.dist_margin:
+            # if the leader is moving, move
+            if self.distance > self.target:
+                self.twist.v = self.varying_velocity
+                self.twist.omega = 0
+                # if the duckiebot is lagging behind the leader, speed up
+                # for this need to calculate the leader's relative velocity
+                # if (self.distance - self.last_distance)/(self.last_time - rospy.get_time()) > 0
+                # self.varying_velocity = self.varying_velocity + 0.01
+
+        self.last_distance = self.distance
+        self.last_time = rospy.get_time()
+        self.vel_pub.publish(self.twist)
 
     def drive(self):
         if self.intersection_detected:
@@ -215,7 +246,8 @@ class DuckiebotTailingNode(DTROS):
                 P = -self.proportional * self.P
 
                 # D Term
-                d_error = (self.proportional - self.last_error) / (rospy.get_time() - self.last_time)
+                d_error = (self.proportional - self.last_error) / \
+                    (rospy.get_time() - self.last_time)
                 self.last_error = self.proportional
                 self.last_time = rospy.get_time()
                 D = d_error * self.D
@@ -223,19 +255,21 @@ class DuckiebotTailingNode(DTROS):
                 self.twist.v = self.velocity
                 self.twist.omega = P + D
                 if DEBUG:
-                    self.loginfo(self.proportional, P, D, self.twist.omega, self.twist.v)
+                    self.loginfo(self.proportional, P, D,
+                                 self.twist.omega, self.twist.v)
 
             self.vel_pub.publish(self.twist)
 
     def intersection_sequence(self):
         # for now
         rospy.loginfo("detected intersection")
-        # self.changeLED(1)
+        # self.changeLED(1) ######## waiting for LED service takes too long
         # rospy.sleep(5)
         # self.changeLED(0)
         self.drive()
 
     def detect_intersection(self, img_msg):
+        # detect an intersection by finding the corresponding apriltags
         cv_image = None
         try:
             cv_image = self.bridge.compressed_imgmsg_to_cv2(img_msg)
@@ -244,14 +278,16 @@ class DuckiebotTailingNode(DTROS):
             return []
 
         # undistort the image
-        newcameramtx, roi=cv2.getOptimalNewCameraMatrix(self.K, self.D, (self.w, self.h), 0, (self.w, self.h))
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(
+            self.K, self.D, (self.w, self.h), 0, (self.w, self.h))
         image_np = cv2.undistort(cv_image, self.K, self.D, None, newcameramtx)
 
         # convert the image to black and white
         image_gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
 
         # detect tags present in image
-        tags = self.at_detector.detect(image_gray, estimate_tag_pose=True, camera_params=self.camera_params, tag_size=0.065)
+        tags = self.at_detector.detect(
+            image_gray, estimate_tag_pose=True, camera_params=self.camera_params, tag_size=0.065)
 
         closest_tag_z = 1000
         closest = None
@@ -280,17 +316,19 @@ class DuckiebotTailingNode(DTROS):
             rospy.loginfo("Failed to publish LEDs: " + str(e))
 
     def detect_intersection_with_reds(self, img):
+        # doesn't work, remove
         img = img[300:-1, :, :]
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_range = np.array([160, 50, 50])
-        upper_range = np.array([180, 255,255])
+        upper_range = np.array([180, 255, 255])
         red_lower_range = np.array([0, 95, 153])
-        red_upper_range = np.array([7, 244,255])
+        red_upper_range = np.array([7, 244, 255])
         lower_mask = cv2.inRange(hsv, lower_range, upper_range)
         upper_mask = cv2.inRange(hsv, red_lower_range, red_upper_range)
         full_mask = lower_mask + upper_mask
         edged = cv2.Canny(full_mask, 30, 200)
-        contours, hierarchy = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        contours, hierarchy = cv2.findContours(
+            edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
         max_area = 20
         max_idx = -1
@@ -310,14 +348,14 @@ class DuckiebotTailingNode(DTROS):
         for i in range(8):
             self.vel_pub.publish(self.twist)
 
-    def readYamlFile(self,fname):
+    def readYamlFile(self, fname):
         with open(fname, 'r') as in_file:
             try:
                 yaml_dict = yaml.load(in_file)
                 return yaml_dict
             except yaml.YAMLError as exc:
                 self.log("YAML syntax error. File: %s fname. Exc: %s"
-                         %(fname, exc), type='fatal')
+                         % (fname, exc), type='fatal')
                 rospy.signal_shutdown()
                 return
 
