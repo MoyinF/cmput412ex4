@@ -46,13 +46,12 @@ class DuckiebotTailingNode(DTROS):
         self.bridge = CvBridge()
         self.jpeg = TurboJPEG()
 
+        # info from subscribers
         self.detection = False
-        self.distance = 0
         self.intersection_detected = False
 
-        self.loginfo("Initialized")
-
         # find the calibration parameters
+        # for detecting apriltags
         camera_intrinsic_dict = self.readYamlFile(
             f'/data/config/calibrations/camera_intrinsic/{self.veh}.yaml')
 
@@ -97,7 +96,7 @@ class DuckiebotTailingNode(DTROS):
         self.decision_threshold = 10
         self.z_threshold = 0.17
 
-        # PID Variables
+        # PID Variables for driving
         self.proportional = None
         if ENGLISH:
             self.offset = -170
@@ -112,17 +111,21 @@ class DuckiebotTailingNode(DTROS):
         self.last_error = 0
         self.last_time = rospy.get_time()
 
+        # PID Variables for tailing a duckiebot
+        self.distance = 0
         self.forward_P = 0.005
-        self.forward_D = -0.001
-        self.target = 0.025
-        self.forward_prop = 0
+        self.forward_D = 0.001
+        self.target = 0.25
+        self.forward_error = 0
         self.last_fwd_err = 0
         self.last_distance = 0
+        self.dist_margin = 0.05
 
         # Service proxies
         # rospy.wait_for_service(f'/{self.veh}/led_emitter_node/set_pattern')
         # self.led_service = rospy.ServiceProxy(f'/{self.veh}/led_emitter_node/set_pattern', ChangePattern)
 
+        self.loginfo("Initialized")
         # Shutdown hook
         rospy.on_shutdown(self.hook)
 
@@ -178,47 +181,59 @@ class DuckiebotTailingNode(DTROS):
             rect_img_msg = CompressedImage(
                 format="jpeg", data=self.jpeg.encode(crop))
             self.pub_mask.publish(rect_img_msg)
-        if DEBUG:
-            rect_img_msg = CompressedImage(
-                format="jpeg", data=self.jpeg.encode(crop))
-            self.pub_mask.publish(rect_img_msg)
 
-    def tail(self):
-        # P Term
-        self.forward_prop = self.distance - self.target
-        P = -self.forward_prop * self.forward_P
+    def tailPID(self):
+        # see how it behaves when the leader is turning at a curve
 
-        # D Term
-        d_error = (self.forward_prop - self.last_fwd_err) / \
+        # probably want to add intersection detection here (at the beginning)
+        # but before that:
+        # see how it behaves when the leader turns at an intersection
+
+        # forward error is negative if duckiebot is too close, positive if too far
+        self.forward_error = self.distance - self.target
+        P = self.forward_error * self.forward_P
+
+        d_error = (self.forward_error - self.last_fwd_err) / \
             (rospy.get_time() - self.last_time)
-        self.last_fwd_err = self.forward_prop
+        self.last_fwd_err = self.forward_error
         self.last_time = rospy.get_time()
-        D = d_error * self.forward_D
+        D = -d_error * self.forward_D
 
-        if self.distance <= self.last_distance:
+        if self.forward_error < 0:
+            # can change to slow down (or move back) instead of stopping
             self.twist.v = 0
             self.twist.omega = 0
-        elif self.distance > self.last_distance:
-            # if the duckiebot is lagging behind the leader, speed up
-            if self.distance > self.target:
-                # self.varying_velocity = self.varying_velocity + 0.01
-                self.twist.v = self.varying_velocity
-                self.twist.omega = 0
+        else:
+            # can change to update varying velocity
+            # i.e. self.varying_velocity = self.varying_velocity + P + D
+            # then self.twist.v = self.varying_velocity
+            self.twist.v = self.velocity + P + D
+            self.twist.omega = 0
         self.last_distance = self.distance
         self.vel_pub.publish(self.twist)
 
-        '''
-            elif self.forward_prop <= 0:
-                self.varying_velocity = self.varying_velocity - 0.01
+        # how to do: (turning within curved lanes + turning at intersections)? ##
+        # self.twist.omega = P + D
+
+    def tail(self):
+        # Might have been wonky because of bad target value, need to test
+        if self.distance <= self.last_distance:
+            # if the leader isn't moving, stop
+            self.twist.v = 0
+            self.twist.omega = 0
+        elif self.distance > self.last_distance + self.dist_margin:
+            # if the leader is moving, move
+            if self.distance > self.target:
                 self.twist.v = self.varying_velocity
                 self.twist.omega = 0
-            elif self.forward_prop > 0:
-                self.twist.v = self.velocity
-                self.twist.omega = 0
-            '''
+                # if the duckiebot is lagging behind the leader, speed up
+                # for this need to calculate the leader's relative velocity
+                # if (self.distance - self.last_distance)/(self.last_time - rospy.get_time()) > 0
+                # self.varying_velocity = self.varying_velocity + 0.01
 
-        # deal with turns later
-        # self.twist.omega = P + D
+        self.last_distance = self.distance
+        self.last_time = rospy.get_time()
+        self.vel_pub.publish(self.twist)
 
     def drive(self):
         if self.intersection_detected:
