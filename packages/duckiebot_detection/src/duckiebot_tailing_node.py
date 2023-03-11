@@ -9,7 +9,7 @@ from turbojpeg import TurboJPEG
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
 import numpy as np
-from duckietown_msgs.msg import WheelsCmdStamped, Twist2DStamped, BoolStamped
+from duckietown_msgs.msg import WheelsCmdStamped, Twist2DStamped, BoolStamped, VehicleCorners
 from duckietown_msgs.srv import ChangePattern
 from dt_apriltags import Detector, Detection
 import yaml
@@ -41,6 +41,7 @@ class DuckiebotTailingNode(DTROS):
             f'/{self.veh}/duckiebot_distance_node/distance', Float32, self.dist_callback)
         self.sub_detection = rospy.Subscriber(
             f'/{self.veh}/duckiebot_detection_node/detection', BoolStamped, self.detection_callback)
+        self.sub_centers = rospy.Subscriber(f'/{self.veh}/duckiebot_detection_node/centers', VehicleCorners, self.centers_callback, queue_size=1)
 
         # image processing tools
         self.bridge = CvBridge()
@@ -49,6 +50,7 @@ class DuckiebotTailingNode(DTROS):
         # info from subscribers
         self.detection = False
         self.intersection_detected = False
+        self.centers = None
 
         # find the calibration parameters
         # for detecting apriltags
@@ -82,10 +84,12 @@ class DuckiebotTailingNode(DTROS):
                                     decode_sharpening=0.25,
                                     debug=0)
         self.intersections = {
-            133: 'RED',  # T intersection
-            153: 'RED',  # T intersection
-            62: 'RED',  # T intersection
-            58: 'RED',  # T intersection
+            133: 'INTER',  # T intersection
+            153: 'INTER',  # T intersection
+            62: 'INTER',  # T intersection
+            58: 'INTER',  # T intersection
+            162: 'STOP',  # Stop sign
+            169: 'STOP'   # Stop sign
         }
         self.led_colors = {
             0: 'WHITE',
@@ -94,7 +98,7 @@ class DuckiebotTailingNode(DTROS):
 
         # apriltag detection filters
         self.decision_threshold = 10
-        self.z_threshold = 0.17
+        self.z_threshold = 0.5
 
         # PID Variables for driving
         self.proportional = None
@@ -115,11 +119,12 @@ class DuckiebotTailingNode(DTROS):
         self.distance = 0
         self.forward_P = 0.005
         self.forward_D = 0.001
-        self.target = 0.25
+        self.target = 0.40
         self.forward_error = 0
         self.last_fwd_err = 0
         self.last_distance = 0
         self.dist_margin = 0.05
+        self.tailing = False
 
         # Service proxies
         # rospy.wait_for_service(f'/{self.veh}/led_emitter_node/set_pattern')
@@ -130,10 +135,13 @@ class DuckiebotTailingNode(DTROS):
         rospy.on_shutdown(self.hook)
 
     def run(self):
-        if self.detection:
+        if self.intersection_detected:
+            self.intersection_sequence()
+        elif self.detection:
+            self.tailing = True
             self.tailPID()
-
         else:
+            self.tailing = False
             self.drive()
 
     def dist_callback(self, msg):
@@ -141,6 +149,9 @@ class DuckiebotTailingNode(DTROS):
 
     def detection_callback(self, msg):
         self.detection = msg.data
+
+    def centers_callback(self, msg):
+        self.centers = msg.corners
 
     def img_callback(self, msg):
         img = self.jpeg.decode(msg.data)
@@ -182,6 +193,16 @@ class DuckiebotTailingNode(DTROS):
                 format="jpeg", data=self.jpeg.encode(crop))
             self.pub_mask.publish(rect_img_msg)
 
+    def left_turn(self):
+        self.twist.v = self.velocity
+        self.twist.omega = 0.5
+        rospy.sleep(2)
+
+    def right_turn(self):
+        self.twist.v = self.velocity
+        self.twist.omega = 0.75
+        rospy.sleep(1)
+
     def tailPID(self):
         # see how it behaves when the leader is turning at a curve
 
@@ -191,29 +212,36 @@ class DuckiebotTailingNode(DTROS):
 
         # forward error is negative if duckiebot is too close, positive if too far
         self.forward_error = self.distance - self.target
-        P = self.forward_error * self.forward_P
+        tail_P = self.forward_error * self.forward_P
 
-        d_error = (self.forward_error - self.last_fwd_err) / \
+        tail_d_error = (self.forward_error - self.last_fwd_err) / \
             (rospy.get_time() - self.last_time)
         self.last_fwd_err = self.forward_error
         self.last_time = rospy.get_time()
-        D = -d_error * self.forward_D
+        tail_D = -tail_d_error * self.forward_D
 
         if self.forward_error < 0:
             # can change to slow down (or move back) instead of stopping
             self.twist.v = 0
             self.twist.omega = 0
         else:
-            # can change to update varying velocity
-            # i.e. self.varying_velocity = self.varying_velocity + P + D
-            # then self.twist.v = self.varying_velocity
-            self.twist.v = self.velocity + P + D
-            self.twist.omega = 0
+            self.twist.v = self.velocity + tail_P + tail_D
+            if self.proportional is None:
+                self.twist.omega = 0
+            else:
+                # P Term
+                P = -self.proportional * self.P
+
+                # D Term
+                d_error = (self.proportional - self.last_error) / \
+                    (rospy.get_time() - self.last_time)
+                self.last_error = self.proportional
+                self.last_time = rospy.get_time()
+                D = d_error * self.D
+                self.twist.omega = P + D
+
         self.last_distance = self.distance
         self.vel_pub.publish(self.twist)
-
-        # how to do: (turning within curved lanes + turning at intersections)? ##
-        # self.twist.omega = P + D
 
     def tail(self):
         # Might have been wonky because of bad target value, need to test
@@ -236,37 +264,77 @@ class DuckiebotTailingNode(DTROS):
         self.vel_pub.publish(self.twist)
 
     def drive(self):
-        if self.intersection_detected:
-            self.intersection_sequence()
+        if self.proportional is None:
+            self.twist.omega = 0
         else:
-            if self.proportional is None:
-                self.twist.omega = 0
-            else:
-                # P Term
-                P = -self.proportional * self.P
+            # P Term
+            P = -self.proportional * self.P
 
-                # D Term
-                d_error = (self.proportional - self.last_error) / \
-                    (rospy.get_time() - self.last_time)
-                self.last_error = self.proportional
-                self.last_time = rospy.get_time()
-                D = d_error * self.D
+            # D Term
+            d_error = (self.proportional - self.last_error) / \
+                (rospy.get_time() - self.last_time)
+            self.last_error = self.proportional
+            self.last_time = rospy.get_time()
+            D = d_error * self.D
 
-                self.twist.v = self.velocity
-                self.twist.omega = P + D
-                if DEBUG:
-                    self.loginfo(self.proportional, P, D,
-                                 self.twist.omega, self.twist.v)
+            self.twist.v = self.velocity
+            self.twist.omega = P + D
+            if self.pub_img_bool:
+                self.loginfo("proportional: {}, P: {}, D: {}, omega: {}, v: {}".format(self.proportional, P, D, self.twist.omega, self.twist.v))
 
-            self.vel_pub.publish(self.twist)
+        self.vel_pub.publish(self.twist)
 
     def intersection_sequence(self):
         # for now
         rospy.loginfo("detected intersection")
         # self.changeLED(1) ######## waiting for LED service takes too long
-        # rospy.sleep(5)
+
+        # latency between detecting intersection and stopping
+        wait_time = 1.5 # seconds
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + wait_time:
+            self.drive()
+
+        # stop
+        self.twist.v = 0
+        self.twist.omega = 0
+        self.vel_pub.publish(self.twist)
+
+        turn = 'STRAIGHT'
+        wait_time = 5 # seconds
+        start_time = rospy.get_time()
+        last_x = 0
+        straight_threshold = 100
+        while rospy.get_time() < start_time + wait_time:
+            # update last known x coordinate of the bot
+            if self.detection and len(self.centers)>0:
+                last_x = self.centers[0].x
+
+        if last_x < 320 - straight_threshold:
+            turn = 'LEFT'
+        elif last_x > 320 + straight_threshold:
+            turn = 'RIGHT'
+
         # self.changeLED(0)
-        self.drive()
+        if self.tailing:
+            # if the leader kept moving straight, move straight
+            if self.detection:
+                # edge case: really slow turning
+                self.tailPID()
+            # could check whether we are at stop or intersection
+            # if the leader turned right, turn right
+            elif turn == 'RIGHT':
+                self.right_turn()
+            # if the leader turned left, turn left
+            elif turn == 'LEFT':
+                self.left_turn()
+        else:
+            wait_time = 0.75 # seconds
+            start_time = rospy.get_time()
+            while rospy.get_time() < start_time + wait_time:
+                self.twist.v = self.velocity
+                self.twist.omega = 0
+                self.vel_pub.publish(self.twist)
 
     def detect_intersection(self, img_msg):
         # detect an intersection by finding the corresponding apriltags
