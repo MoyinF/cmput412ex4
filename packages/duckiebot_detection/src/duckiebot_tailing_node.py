@@ -83,6 +83,7 @@ class DuckiebotTailingNode(DTROS):
                                     refine_edges=1,
                                     decode_sharpening=0.25,
                                     debug=0)
+        self.at_detected = 0
         self.intersections = {
             133: 'INTER',  # T intersection
             153: 'INTER',  # T intersection
@@ -110,8 +111,9 @@ class DuckiebotTailingNode(DTROS):
         self.velocity = 0.25
         self.twist = Twist2DStamped(v=self.velocity, omega=0)
 
-        self.P = 0.025
-        self.D = -0.0025
+        self.P = 0.01
+        self.D = -0.002
+        self.D_threshold = 7
         self.last_error = 0
         self.last_time = rospy.get_time()
 
@@ -244,7 +246,7 @@ class DuckiebotTailingNode(DTROS):
         self.vel_pub.publish(self.twist)
 
     def tail(self):
-        # Might have been wonky because of bad target value, need to test
+        # No PID version
         if self.distance <= self.last_distance:
             # if the leader isn't moving, stop
             self.twist.v = 0
@@ -277,6 +279,16 @@ class DuckiebotTailingNode(DTROS):
             self.last_time = rospy.get_time()
             D = d_error * self.D
 
+            if abs(D) > 5:
+                # this means derivative kick
+                if P > 0:
+                    # Want D to be opposite sign of P. May change magnitude of D later.
+                    D = -P * 0.5
+                elif P < 0:
+                    D = -P * 0.5
+                else:
+                    D = 0
+
             self.twist.v = self.velocity
             self.twist.omega = P + D
             if self.pub_img_bool:
@@ -304,7 +316,7 @@ class DuckiebotTailingNode(DTROS):
         wait_time = 5 # seconds
         start_time = rospy.get_time()
         last_x = 0
-        straight_threshold = 100
+        straight_threshold = 0
         while rospy.get_time() < start_time + wait_time:
             # update last known x coordinate of the bot
             if self.detection and len(self.centers)>0:
@@ -319,15 +331,24 @@ class DuckiebotTailingNode(DTROS):
         if self.tailing:
             # if the leader kept moving straight, move straight
             if self.detection:
+                # if we can still detect the leader, it didn't turn, keep tailing
                 # edge case: really slow turning
                 self.tailPID()
-            # could check whether we are at stop or intersection
-            # if the leader turned right, turn right
-            elif turn == 'RIGHT':
-                self.right_turn()
-            # if the leader turned left, turn left
-            elif turn == 'LEFT':
-                self.left_turn()
+
+            else:
+                # the leader turned
+                # if we are at a T-intersection, for right lane following
+                # the only possible turn is a left turn
+                if self.intersections[self.at_detected] == 'INTER':
+                    self.left_turn()
+                # for a stop intersection, the turn could be left or right
+                else:
+                    # if the leader turned right, turn right
+                    if turn == 'RIGHT':
+                        self.right_turn()
+                    # if the leader turned left, turn left
+                    elif turn == 'LEFT':
+                        self.left_turn()
         else:
             wait_time = 0.75 # seconds
             start_time = rospy.get_time()
@@ -373,6 +394,7 @@ class DuckiebotTailingNode(DTROS):
 
         if closest:
             if closest.tag_id in self.intersections:
+                self.at_detected = closest.tag_id
                 return True
         return False
 
