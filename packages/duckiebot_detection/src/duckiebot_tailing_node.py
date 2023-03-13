@@ -133,6 +133,29 @@ class DuckiebotTailingNode(DTROS):
         self.loginfo("Initialized")
         # Shutdown hook
         rospy.on_shutdown(self.hook)
+        
+        # PID variables for drive_2
+        self.P_v = 0.5
+        self.D_v = 0.1
+        self.P_omega = 0.015
+        self.D_omega = 0.015
+        
+        self.last_P_v_err = 0
+        self.last_P_omega_err = 0
+        
+        self.camera_center = 340
+        self.turning_threshold = 160
+        
+        self.proportional = 0
+        
+        self.target_forward = 0.5
+        self.current_forward = self.target_forward
+        self.speed_up = 0.5
+        
+        self.target_lateral = 170
+        self.current_lateral = 0
+        
+        self.leader_x = self.camera_center
 
     def run(self):
         if self.intersection_detected:
@@ -143,15 +166,39 @@ class DuckiebotTailingNode(DTROS):
         else:
             self.tailing = False
             self.drive()
+            
+    def run_2(self):
+        rate = rospy.Rate(8)  # 8hz
+        while not rospy.is_shutdown():
+            if self.intersection_detected:
+                self.intersection_sequence_2()
+
+            self.drive_2()
+            rate.sleep()
+        
 
     def dist_callback(self, msg):
         self.distance = msg.data
+        self.current_forward = msg.data
 
     def detection_callback(self, msg):
         self.detection = msg.data
 
     def centers_callback(self, msg):
         self.centers = msg.corners
+        
+        if self.detection and len(self.centers) > 0:
+            # find the middle of the circle grid
+            middle = 0
+            i = 0
+            while i < len(self.centers):
+                middle += self.centers[i].x
+                i += 1
+            middle = middle / i
+            
+            # update the last known position of the bot ahead
+            self.leader_x = middle
+            
 
     def img_callback(self, msg):
         img = self.jpeg.decode(msg.data)
@@ -179,6 +226,7 @@ class DuckiebotTailingNode(DTROS):
                 cx = int(M['m10'] / M['m00'])
                 cy = int(M['m01'] / M['m00'])
                 self.proportional = cx - int(crop_width / 2) + self.offset
+                self.current_lateral = cx
                 if DEBUG:
                     cv2.drawContours(crop, contours, max_idx, (0, 255, 0), 3)
                     cv2.circle(crop, (cx, cy), 7, (0, 0, 255), -1)
@@ -194,14 +242,22 @@ class DuckiebotTailingNode(DTROS):
             self.pub_mask.publish(rect_img_msg)
 
     def left_turn(self):
+        rospy.loginfo("Beginning left turn")
         self.twist.v = self.velocity
-        self.twist.omega = 0.5
-        rospy.sleep(2)
+        self.twist.omega = 3
+        
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + 1:
+            self.vel_pub.publish(self.twist)
 
     def right_turn(self):
+        rospy.loginfo("Beginning right turn")
         self.twist.v = self.velocity
-        self.twist.omega = 0.75
-        rospy.sleep(1)
+        self.twist.omega = -4
+        
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + 0.5:
+            self.vel_pub.publish(self.twist)
 
     def tailPID(self):
         # see how it behaves when the leader is turning at a curve
@@ -284,6 +340,48 @@ class DuckiebotTailingNode(DTROS):
 
         self.vel_pub.publish(self.twist)
 
+    def drive_2(self):
+        
+        # Correct omega based on distance to yellow line
+        P_omega_error = self.target_lateral - self.current_lateral
+        P_omega_correction = P_omega_error * self.P_omega
+
+        D_omega_err = (P_omega_error - self.last_P_omega_err) / (rospy.get_time() - self.last_time)
+        D_omega_correction = D_omega_err * self.D_omega
+
+        if D_omega_correction > 2.5 or D_omega_correction < -2.5:
+            # ignore derivative kicks
+            D_omega_correction = 0
+            	
+        self.twist.omega = P_omega_correction + D_omega_correction
+        
+        # Correct velocity based on distance to bot ahead
+        if not self.detection:
+            self.current_forward = self.target_forward + self.speed_up
+            
+        P_v_error = self.current_forward - self.target_forward
+        P_v_correction = P_v_error * self.P_v
+
+        D_v_error = (P_v_error - self.last_P_v_err) / (rospy.get_time() - self.last_time)
+        D_v_correction = D_v_error * self.D_v
+        
+        if P_v_correction < 0:
+            # stop when bot too close
+            self.twist.v = 0
+            self.twist.omega = 0
+        else:
+            self.twist.v = P_v_correction + D_v_correction
+        
+        # Publish new velocity and Omega
+        #rospy.loginfo(f"\ntarget_lateral: {self.target_lateral} \ncurrent_lateral: {self.current_lateral} \ntarget_foward: {self.target_forward} \ncurrent_forward: {self.current_forward}")
+        #rospy.loginfo(f"\nP_v_correction: {P_v_correction} \nD_v_correction: {D_v_correction} \nP_omega_correction: {P_omega_correction} \nD_omega_correction: {D_omega_correction}")
+        self.vel_pub.publish(self.twist)
+        
+        # update class atributes
+        self.last_P_v_err = P_v_error
+        self.last_P_omega_err = P_omega_error
+        self.last_time = rospy.get_time()
+    
     def intersection_sequence(self):
         # for now
         rospy.loginfo("detected intersection")
@@ -336,6 +434,44 @@ class DuckiebotTailingNode(DTROS):
                 self.twist.omega = 0
                 self.vel_pub.publish(self.twist)
 
+    def intersection_sequence_2(self):
+    
+        rospy.loginfo("Beginning intersection sequence")
+
+        # continue driving until reaching stop line
+        wait_time = 1.5 # seconds
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + wait_time:
+            self.drive_2()
+
+        # stop the bot
+        self.twist.v = 0
+        self.twist.omega = 0
+        for i in range(8):
+            self.vel_pub.publish(self.twist)
+
+        # scan for bot to follow while waiting 3 seconds
+        wait_time = 3 # seconds
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + wait_time:
+            continue
+        
+        rospy.loginfo(f"Last detection: {self.leader_x}")
+
+        if self.leader_x < self.camera_center - self.turning_threshold:
+            self.left_turn()
+        elif self.leader_x > self.camera_center + self.turning_threshold:
+            self.right_turn()
+        else:
+            # drive straight
+            wait_time = 0.75 # seconds
+            start_time = rospy.get_time()
+            while rospy.get_time() < start_time + wait_time:
+                self.twist.v = self.velocity
+                self.twist.omega = 0
+                self.vel_pub.publish(self.twist)
+
+
     def detect_intersection(self, img_msg):
         # detect an intersection by finding the corresponding apriltags
         cv_image = None
@@ -383,31 +519,6 @@ class DuckiebotTailingNode(DTROS):
         except Exception as e:
             rospy.loginfo("Failed to publish LEDs: " + str(e))
 
-    def detect_intersection_with_reds(self, img):
-        # doesn't work, remove
-        img = img[300:-1, :, :]
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_range = np.array([160, 50, 50])
-        upper_range = np.array([180, 255, 255])
-        red_lower_range = np.array([0, 95, 153])
-        red_upper_range = np.array([7, 244, 255])
-        lower_mask = cv2.inRange(hsv, lower_range, upper_range)
-        upper_mask = cv2.inRange(hsv, red_lower_range, red_upper_range)
-        full_mask = lower_mask + upper_mask
-        edged = cv2.Canny(full_mask, 30, 200)
-        contours, hierarchy = cv2.findContours(
-            edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
-        max_area = 20
-        max_idx = -1
-        for i in range(len(contours)):
-            area = cv2.contourArea(contours[i])
-            if area > max_area:
-                max_idx = i
-                max_area = area
-
-        return max_idx != -1
-
     def hook(self):
         print("SHUTTING DOWN")
         self.twist.v = 0
@@ -430,7 +541,4 @@ class DuckiebotTailingNode(DTROS):
 
 if __name__ == "__main__":
     node = DuckiebotTailingNode("duckiebot_tailing_node")
-    rate = rospy.Rate(8)  # 8hz
-    while not rospy.is_shutdown():
-        node.run()
-        rate.sleep()
+    node.run_2()
