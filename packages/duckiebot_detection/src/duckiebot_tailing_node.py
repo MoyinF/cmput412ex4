@@ -9,8 +9,8 @@ from turbojpeg import TurboJPEG
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
 import numpy as np
-from duckietown_msgs.msg import WheelsCmdStamped, Twist2DStamped, BoolStamped, VehicleCorners
-from duckietown_msgs.srv import ChangePattern
+from duckietown_msgs.msg import WheelsCmdStamped, Twist2DStamped, BoolStamped, VehicleCorners, LEDPattern
+from duckietown_msgs.srv import ChangePattern, SetCustomLEDPattern
 from dt_apriltags import Detector, Detection
 import yaml
 
@@ -125,15 +125,24 @@ class DuckiebotTailingNode(DTROS):
         self.last_distance = 0
         self.dist_margin = 0.05
         self.tailing = False
+        
+        self.camera_center = 340
+        self.leader_x = self.camera_center
+        self.straight_threshold = 75
+        
+        self.turn_speed = 0.15
 
         # Service proxies
         # rospy.wait_for_service(f'/{self.veh}/led_emitter_node/set_pattern')
         # self.led_service = rospy.ServiceProxy(f'/{self.veh}/led_emitter_node/set_pattern', ChangePattern)
+        rospy.wait_for_service(f'/{self.veh}/led_emitter_node/set_custom_pattern')
+        self.led_service = rospy.ServiceProxy(f'/{self.veh}/led_emitter_node/set_custom_pattern', SetCustomLEDPattern, persistent=True)
 
         self.loginfo("Initialized")
         # Shutdown hook
         rospy.on_shutdown(self.hook)
-
+        
+        
     def run(self):
         if self.intersection_detected:
             self.intersection_sequence()
@@ -152,6 +161,18 @@ class DuckiebotTailingNode(DTROS):
 
     def centers_callback(self, msg):
         self.centers = msg.corners
+        
+        if self.detection and len(self.centers) > 0:
+            # find the middle of the circle grid
+            middle = 0
+            i = 0
+            while i < len(self.centers):
+                middle += self.centers[i].x
+                i += 1
+            middle = middle / i
+            
+            # update the last known position of the bot ahead
+            self.leader_x = middle
 
     def img_callback(self, msg):
         img = self.jpeg.decode(msg.data)
@@ -194,14 +215,30 @@ class DuckiebotTailingNode(DTROS):
             self.pub_mask.publish(rect_img_msg)
 
     def left_turn(self):
-        self.twist.v = self.velocity
-        self.twist.omega = 0.5
-        rospy.sleep(2)
+        rospy.loginfo("Beginning left turn")
+        
+        self.set_lights("left")
+        
+        self.twist.v = self.turn_speed
+        self.twist.omega = 3
+        
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + 0.8:
+            
+            self.vel_pub.publish(self.twist)
 
     def right_turn(self):
-        self.twist.v = self.velocity
-        self.twist.omega = 0.75
-        rospy.sleep(1)
+        rospy.loginfo("Beginning right turn")
+        
+        self.set_lights("right")
+        
+        self.twist.v = self.turn_speed
+        self.twist.omega = -4
+        
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + 0.6:
+            
+            self.vel_pub.publish(self.twist)
 
     def tailPID(self):
         # see how it behaves when the leader is turning at a curve
@@ -225,7 +262,7 @@ class DuckiebotTailingNode(DTROS):
             self.twist.v = 0
             self.twist.omega = 0
         else:
-            self.twist.v = self.velocity + tail_P + tail_D
+            self.twist.v = tail_P + tail_D
             if self.proportional is None:
                 self.twist.omega = 0
             else:
@@ -279,8 +316,8 @@ class DuckiebotTailingNode(DTROS):
 
             self.twist.v = self.velocity
             self.twist.omega = P + D
-            if self.pub_img_bool:
-                self.loginfo("proportional: {}, P: {}, D: {}, omega: {}, v: {}".format(self.proportional, P, D, self.twist.omega, self.twist.v))
+            # if self.pub_img_bool:
+                # self.loginfo("proportional: {}, P: {}, D: {}, omega: {}, v: {}".format(self.proportional, P, D, self.twist.omega, self.twist.v))
 
         self.vel_pub.publish(self.twist)
 
@@ -300,41 +337,28 @@ class DuckiebotTailingNode(DTROS):
         self.twist.omega = 0
         self.vel_pub.publish(self.twist)
 
-        turn = 'STRAIGHT'
+        self.set_lights("stop")
         wait_time = 5 # seconds
         start_time = rospy.get_time()
-        last_x = 0
-        straight_threshold = 100
         while rospy.get_time() < start_time + wait_time:
-            # update last known x coordinate of the bot
-            if self.detection and len(self.centers)>0:
-                last_x = self.centers[0].x
+            continue
 
-        if last_x < 320 - straight_threshold:
-            turn = 'LEFT'
-        elif last_x > 320 + straight_threshold:
-            turn = 'RIGHT'
-
-        # self.changeLED(0)
-        if self.tailing:
-            # if the leader kept moving straight, move straight
-            if self.detection:
-                # edge case: really slow turning
-                self.tailPID()
-            # could check whether we are at stop or intersection
-            # if the leader turned right, turn right
-            elif turn == 'RIGHT':
-                self.right_turn()
-            # if the leader turned left, turn left
-            elif turn == 'LEFT':
-                self.left_turn()
+        if self.leader_x < self.camera_center - self.straight_threshold:
+            # turn to the left
+            self.left_turn()
+        elif self.leader_x > self.camera_center + self.straight_threshold:
+            # turn to the right
+            self.right_turn()
         else:
+            # drive straight through intersection
             wait_time = 0.75 # seconds
             start_time = rospy.get_time()
             while rospy.get_time() < start_time + wait_time:
                 self.twist.v = self.velocity
                 self.twist.omega = 0
                 self.vel_pub.publish(self.twist)
+                
+        self.set_lights("off")
 
     def detect_intersection(self, img_msg):
         # detect an intersection by finding the corresponding apriltags
@@ -407,6 +431,32 @@ class DuckiebotTailingNode(DTROS):
                 max_area = area
 
         return max_idx != -1
+        
+    def set_lights(self, state):
+
+        msg = LEDPattern()
+        if state == "left":
+            msg.color_list = ['yellow','yellow','switchedoff','switchedoff','switchedoff']
+            msg.color_mask = [0, 0, 0, 0, 0]
+            msg.frequency = 0
+            msg.frequency_mask = [0, 1, 0, 0, 0]
+        elif state == "right":
+            msg.color_list = ['switchedoff','switchedoff','yellow','yellow','yellow']
+            msg.color_mask = [0, 0, 0, 0, 0]
+            msg.frequency = 0
+            msg.frequency_mask = [0, 0, 0, 1, 0]
+        elif state == "stop":
+            msg.color_list = ['switchedoff','red','switchedoff','red','switchedoff']
+            msg.color_mask = [0, 0, 0, 0, 0]
+            msg.frequency = 0
+            msg.frequency_mask = [0, 0, 0, 0, 0]
+        elif state == "off":
+            msg.color_list = ['switchedoff','switchedoff','switchedoff','switchedoff','switchedoff']
+            msg.color_mask = [0, 0, 0, 0, 0]
+            msg.frequency = 0
+            msg.frequency_mask = [0, 0, 0, 0, 0]
+
+        self.led_service(msg)
 
     def hook(self):
         print("SHUTTING DOWN")
