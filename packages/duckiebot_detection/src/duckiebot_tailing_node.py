@@ -100,7 +100,7 @@ class DuckiebotTailingNode(DTROS):
 
         # apriltag detection filters
         self.decision_threshold = 10
-        self.z_threshold = 0.5
+        self.z_threshold = 0.35
 
         # PID Variables for driving
         self.proportional = None
@@ -300,32 +300,54 @@ class DuckiebotTailingNode(DTROS):
 
     def intersection_sequence(self):
         # for now
-        rospy.loginfo("detected intersection")
+        rospy.loginfo("INTERSECTION DETECTED. at {} INTERSECTION DETECTED. INTERSECTION DETECTED.".format(str(self.at_distance)))
 
         # latency between detecting intersection and stopping
-        #wait_time = 1.5  # seconds
-        wait_time = 0.3
+        wait_time = 1.5  # seconds
         start_time = rospy.get_time()
-        vel = self.velocity
-        while self.at_distance > 0.1:
-            self.drive()
+        while self.intersection_detected:
+            # should stop detecting when it's right beside the sign
+            # P Term
+            P = -self.proportional * self.P
 
+            # D Term
+            d_error = (self.proportional - self.last_error) / \
+                (rospy.get_time() - self.last_time)
+            self.last_error = self.proportional
+            self.last_time = rospy.get_time()
+            D = d_error * self.D
+
+            self.twist.v = self.velocity
+            self.twist.omega = P + D
+
+            self.vel_pub.publish(self.twist)
+
+        last_vel = self.twist.v
+        last_omega = self.twist.omega
         # stop
         self.twist.v = 0
         self.twist.omega = 0
         self.vel_pub.publish(self.twist)
+        rospy.loginfo("Stopped within the intersection sequence")
 
         self.set_lights("stop")
-        wait_time = 5  # seconds
+        wait_time = 10  # seconds
         start_time = rospy.get_time()
         while rospy.get_time() < start_time + wait_time:
             continue
+        rospy.loginfo("Stopped and continued")
         # drive straight through intersection
+        self.twist.v = last_vel
+        self.twist.omega = last_omega
+        self.vel_pub.publish(self.twist)
+
         wait_time = 0.75  # seconds
         start_time = rospy.get_time()
         while rospy.get_time() < start_time + wait_time:
+            if self.proportional is not None:
+                rospy.loginfo(str(self.proportional))
             self.twist.v = self.velocity
-            self.twist.omega = 0
+            self.twist.omega = last_omega * 0.75 # 0.75 to make sure it's not too much
             self.vel_pub.publish(self.twist)
 
         self.set_lights("off")
