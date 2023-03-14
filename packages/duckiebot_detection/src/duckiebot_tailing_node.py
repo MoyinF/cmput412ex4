@@ -84,6 +84,7 @@ class DuckiebotTailingNode(DTROS):
                                     refine_edges=1,
                                     decode_sharpening=0.25,
                                     debug=0)
+        self.at_distance = 0
         self.intersections = {
             133: 'INTER',  # T intersection
             153: 'INTER',  # T intersection
@@ -302,9 +303,11 @@ class DuckiebotTailingNode(DTROS):
         rospy.loginfo("detected intersection")
 
         # latency between detecting intersection and stopping
-        wait_time = 1.5  # seconds
+        #wait_time = 1.5  # seconds
+        wait_time = 0.3
         start_time = rospy.get_time()
-        while rospy.get_time() < start_time + wait_time:
+        vel = self.velocity
+        while self.at_distance > 0.1:
             self.drive()
 
         # stop
@@ -417,6 +420,7 @@ class DuckiebotTailingNode(DTROS):
 
         if closest:
             if closest.tag_id in self.intersections:
+                self.at_distance = closest.pose_t[2][0]
                 return True
         return False
 
