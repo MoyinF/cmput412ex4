@@ -41,7 +41,8 @@ class DuckiebotTailingNode(DTROS):
             f'/{self.veh}/duckiebot_distance_node/distance', Float32, self.dist_callback)
         self.sub_detection = rospy.Subscriber(
             f'/{self.veh}/duckiebot_detection_node/detection', BoolStamped, self.detection_callback)
-        self.sub_centers = rospy.Subscriber(f'/{self.veh}/duckiebot_detection_node/centers', VehicleCorners, self.centers_callback, queue_size=1)
+        self.sub_centers = rospy.Subscriber(
+            f'/{self.veh}/duckiebot_detection_node/centers', VehicleCorners, self.centers_callback, queue_size=1)
 
         # image processing tools
         self.bridge = CvBridge()
@@ -125,27 +126,31 @@ class DuckiebotTailingNode(DTROS):
         self.last_distance = 0
         self.dist_margin = 0.05
         self.tailing = False
-        
+
         self.camera_center = 340
         self.leader_x = self.camera_center
         self.straight_threshold = 75
-        
+
         self.turn_speed = 0.15
 
         # Service proxies
         # rospy.wait_for_service(f'/{self.veh}/led_emitter_node/set_pattern')
         # self.led_service = rospy.ServiceProxy(f'/{self.veh}/led_emitter_node/set_pattern', ChangePattern)
-        rospy.wait_for_service(f'/{self.veh}/led_emitter_node/set_custom_pattern')
-        self.led_service = rospy.ServiceProxy(f'/{self.veh}/led_emitter_node/set_custom_pattern', SetCustomLEDPattern, persistent=True)
+        rospy.wait_for_service(
+            f'/{self.veh}/led_emitter_node/set_custom_pattern')
+        self.led_service = rospy.ServiceProxy(
+            f'/{self.veh}/led_emitter_node/set_custom_pattern', SetCustomLEDPattern, persistent=True)
 
         self.loginfo("Initialized")
         # Shutdown hook
         rospy.on_shutdown(self.hook)
-        
-        
+
     def run(self):
         if self.intersection_detected:
-            self.intersection_sequence()
+            if self.tailing:
+                self.tailing_intersection()
+            else:
+                self.intersection_sequence()
         elif self.detection:
             self.tailing = True
             self.tailPID()
@@ -161,7 +166,7 @@ class DuckiebotTailingNode(DTROS):
 
     def centers_callback(self, msg):
         self.centers = msg.corners
-        
+
         if self.detection and len(self.centers) > 0:
             # find the middle of the circle grid
             middle = 0
@@ -170,7 +175,7 @@ class DuckiebotTailingNode(DTROS):
                 middle += self.centers[i].x
                 i += 1
             middle = middle / i
-            
+
             # update the last known position of the bot ahead
             self.leader_x = middle
 
@@ -216,37 +221,31 @@ class DuckiebotTailingNode(DTROS):
 
     def left_turn(self):
         rospy.loginfo("Beginning left turn")
-        
+
         self.set_lights("left")
-        
+
         self.twist.v = self.turn_speed
         self.twist.omega = 3
-        
+
         start_time = rospy.get_time()
         while rospy.get_time() < start_time + 0.8:
-            
+
             self.vel_pub.publish(self.twist)
 
     def right_turn(self):
         rospy.loginfo("Beginning right turn")
-        
+
         self.set_lights("right")
-        
+
         self.twist.v = self.turn_speed
         self.twist.omega = -4
-        
+
         start_time = rospy.get_time()
         while rospy.get_time() < start_time + 0.6:
-            
+
             self.vel_pub.publish(self.twist)
 
     def tailPID(self):
-        # see how it behaves when the leader is turning at a curve
-
-        # probably want to add intersection detection here (at the beginning)
-        # but before that:
-        # see how it behaves when the leader turns at an intersection
-
         # forward error is negative if duckiebot is too close, positive if too far
         self.forward_error = self.distance - self.target
         tail_P = self.forward_error * self.forward_P
@@ -258,7 +257,6 @@ class DuckiebotTailingNode(DTROS):
         tail_D = -tail_d_error * self.forward_D
 
         if self.forward_error < 0:
-            # can change to slow down (or move back) instead of stopping
             self.twist.v = 0
             self.twist.omega = 0
         else:
@@ -280,26 +278,6 @@ class DuckiebotTailingNode(DTROS):
         self.last_distance = self.distance
         self.vel_pub.publish(self.twist)
 
-    def tail(self):
-        # Might have been wonky because of bad target value, need to test
-        if self.distance <= self.last_distance:
-            # if the leader isn't moving, stop
-            self.twist.v = 0
-            self.twist.omega = 0
-        elif self.distance > self.last_distance + self.dist_margin:
-            # if the leader is moving, move
-            if self.distance > self.target:
-                self.twist.v = self.varying_velocity
-                self.twist.omega = 0
-                # if the duckiebot is lagging behind the leader, speed up
-                # for this need to calculate the leader's relative velocity
-                # if (self.distance - self.last_distance)/(self.last_time - rospy.get_time()) > 0
-                # self.varying_velocity = self.varying_velocity + 0.01
-
-        self.last_distance = self.distance
-        self.last_time = rospy.get_time()
-        self.vel_pub.publish(self.twist)
-
     def drive(self):
         if self.proportional is None:
             self.twist.omega = 0
@@ -316,18 +294,15 @@ class DuckiebotTailingNode(DTROS):
 
             self.twist.v = self.velocity
             self.twist.omega = P + D
-            # if self.pub_img_bool:
-                # self.loginfo("proportional: {}, P: {}, D: {}, omega: {}, v: {}".format(self.proportional, P, D, self.twist.omega, self.twist.v))
 
         self.vel_pub.publish(self.twist)
 
     def intersection_sequence(self):
         # for now
         rospy.loginfo("detected intersection")
-        # self.changeLED(1) ######## waiting for LED service takes too long
 
         # latency between detecting intersection and stopping
-        wait_time = 1.5 # seconds
+        wait_time = 1.5  # seconds
         start_time = rospy.get_time()
         while rospy.get_time() < start_time + wait_time:
             self.drive()
@@ -338,7 +313,52 @@ class DuckiebotTailingNode(DTROS):
         self.vel_pub.publish(self.twist)
 
         self.set_lights("stop")
-        wait_time = 5 # seconds
+        wait_time = 5  # seconds
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + wait_time:
+            continue
+        # drive straight through intersection
+        wait_time = 0.75  # seconds
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + wait_time:
+            self.twist.v = self.velocity
+            self.twist.omega = 0
+            self.vel_pub.publish(self.twist)
+
+        self.set_lights("off")
+
+    def tailing_intersection(self):
+        # for now
+        rospy.loginfo("detected intersection")
+
+        # stop behind the leading duckiebot
+        # 10 cm, can change to 0.05 m. Chose 10 bc bot underestimates distance
+        stopping_threshold = 0.1
+        while self.forward_error > stopping_threshold:
+            self.tailPID()
+        # stop
+        self.twist.v = 0
+        self.twist.omega = 0
+        self.vel_pub.publish(self.twist)
+
+        # wait until the leading duckiebot has moved
+        starting_distance = self.distance
+        movement_threshold = 1.5
+        while self.detection and self.distance < starting_distance * movement_threshold:
+            continue
+
+        # move forward a bit
+        wait_time = 0.5  # seconds
+        start_time = rospy.get_time()
+        while rospy.get_time() < start_time + wait_time:
+            self.drive()
+        # stop at red line
+        self.twist.v = 0
+        self.twist.omega = 0
+        self.vel_pub.publish(self.twist)
+        self.set_lights("stop")
+
+        wait_time = 5  # seconds
         start_time = rospy.get_time()
         while rospy.get_time() < start_time + wait_time:
             continue
@@ -351,13 +371,13 @@ class DuckiebotTailingNode(DTROS):
             self.right_turn()
         else:
             # drive straight through intersection
-            wait_time = 0.75 # seconds
+            wait_time = 0.75  # seconds
             start_time = rospy.get_time()
             while rospy.get_time() < start_time + wait_time:
                 self.twist.v = self.velocity
                 self.twist.omega = 0
                 self.vel_pub.publish(self.twist)
-                
+
         self.set_lights("off")
 
     def detect_intersection(self, img_msg):
@@ -400,58 +420,30 @@ class DuckiebotTailingNode(DTROS):
                 return True
         return False
 
-    def changeLED(self, tag_id):
-        color = self.led_colors[tag_id]
-        try:
-            self.led_service(String(color))
-        except Exception as e:
-            rospy.loginfo("Failed to publish LEDs: " + str(e))
-
-    def detect_intersection_with_reds(self, img):
-        # doesn't work, remove
-        img = img[300:-1, :, :]
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_range = np.array([160, 50, 50])
-        upper_range = np.array([180, 255, 255])
-        red_lower_range = np.array([0, 95, 153])
-        red_upper_range = np.array([7, 244, 255])
-        lower_mask = cv2.inRange(hsv, lower_range, upper_range)
-        upper_mask = cv2.inRange(hsv, red_lower_range, red_upper_range)
-        full_mask = lower_mask + upper_mask
-        edged = cv2.Canny(full_mask, 30, 200)
-        contours, hierarchy = cv2.findContours(
-            edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
-        max_area = 20
-        max_idx = -1
-        for i in range(len(contours)):
-            area = cv2.contourArea(contours[i])
-            if area > max_area:
-                max_idx = i
-                max_area = area
-
-        return max_idx != -1
-        
     def set_lights(self, state):
 
         msg = LEDPattern()
         if state == "left":
-            msg.color_list = ['yellow','yellow','switchedoff','switchedoff','switchedoff']
+            msg.color_list = ['yellow', 'yellow',
+                              'switchedoff', 'switchedoff', 'switchedoff']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 0
             msg.frequency_mask = [0, 1, 0, 0, 0]
         elif state == "right":
-            msg.color_list = ['switchedoff','switchedoff','yellow','yellow','yellow']
+            msg.color_list = ['switchedoff', 'switchedoff',
+                              'yellow', 'yellow', 'yellow']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 0
             msg.frequency_mask = [0, 0, 0, 1, 0]
         elif state == "stop":
-            msg.color_list = ['switchedoff','red','switchedoff','red','switchedoff']
+            msg.color_list = ['switchedoff', 'red',
+                              'switchedoff', 'red', 'switchedoff']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 0
             msg.frequency_mask = [0, 0, 0, 0, 0]
         elif state == "off":
-            msg.color_list = ['switchedoff','switchedoff','switchedoff','switchedoff','switchedoff']
+            msg.color_list = ['switchedoff', 'switchedoff',
+                              'switchedoff', 'switchedoff', 'switchedoff']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 0
             msg.frequency_mask = [0, 0, 0, 0, 0]
