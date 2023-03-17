@@ -552,26 +552,22 @@ class DuckiebotTailingNode(DTROS):
 
         msg = LEDPattern()
         if state == "left":
-            msg.color_list = ['yellow', 'switchedoff',
-                              'yellow', 'switchedoff', 'switchedoff']
+            msg.color_list = ['yellow','yellow','switchedoff','switchedoff','switchedoff']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 2
-            msg.frequency_mask = [0, 1, 0, 0, 0]
+            msg.frequency_mask = [1, 1, 0, 0, 0]
         elif state == "right":
-            msg.color_list = ['switchedoff', 'yellow',
-                              'switchedoff', 'yellow', 'yellow']
+            msg.color_list = ['switchedoff','switchedoff','yellow','yellow','switchedoff']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 2
-            msg.frequency_mask = [0, 0, 0, 1, 0]
+            msg.frequency_mask = [0, 0, 1, 1, 0]
         elif state == "stop":
-            msg.color_list = ['switchedoff', 'switchedoff',
-                              'red', 'red', 'switchedoff']
+            msg.color_list = ['switchedoff','red','switchedoff','red','switchedoff']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 0
             msg.frequency_mask = [0, 0, 0, 0, 0]
         elif state == "off":
-            msg.color_list = ['switchedoff', 'switchedoff',
-                              'switchedoff', 'switchedoff', 'switchedoff']
+            msg.color_list = ['switchedoff','switchedoff','switchedoff','switchedoff','switchedoff']
             msg.color_mask = [0, 0, 0, 0, 0]
             msg.frequency = 0
             msg.frequency_mask = [0, 0, 0, 0, 0]
